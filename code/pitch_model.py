@@ -1,4 +1,8 @@
-"""Player embeddings predicting pitch results and individual in-play events."""
+"""Player embeddings plus pitch characteristics predicting pitch outcomes.
+
+Pipeline: prepare_pitches -> chronological_split -> PitchPreprocessor.fit(train)
+-> make_dataset -> PitchOutcomeModel. train.py runs the whole thing.
+"""
 
 from pathlib import Path
 
@@ -10,17 +14,11 @@ from torch.nn import functional as F
 from torch.utils.data import TensorDataset
 
 
-IN_PLAY_OUTCOMES = (
-    "single", "double", "triple", "home_run",
-    "field_out", "force_out", "grounded_into_double_play", "double_play",
-    "triple_play", "field_error", "fielders_choice", "fielders_choice_out",
-    "sac_fly", "sac_fly_double_play", "sac_bunt", "sac_bunt_double_play",
-    "other_out", "batter_interference", "catcher_interf", "fan_interference",
-)
 OUTCOMES = (
     "ball", "called_strike", "swinging_strike", "foul", "hit_by_pitch",
-    *IN_PLAY_OUTCOMES,
+    "out_in_play", "single", "double", "triple", "home_run",
 )
+OUTCOME_INDEX = {name: index for index, name in enumerate(OUTCOMES)}
 DESCRIPTION_TO_OUTCOME = {
     "ball": "ball",
     "blocked_ball": "ball",
@@ -31,82 +29,100 @@ DESCRIPTION_TO_OUTCOME = {
     "foul_tip": "foul",
     "hit_by_pitch": "hit_by_pitch",
 }
+# Errors and fielder's choices count as outs: the batter did not earn a hit.
+# Interference events are rare and not about the pitch, so they are excluded.
+IN_PLAY_EVENT_TO_OUTCOME = {
+    "single": "single",
+    "double": "double",
+    "triple": "triple",
+    "home_run": "home_run",
+    **{event: "out_in_play" for event in (
+        "field_out", "force_out", "grounded_into_double_play", "double_play",
+        "triple_play", "field_error", "fielders_choice", "fielders_choice_out",
+        "sac_fly", "sac_fly_double_play", "sac_bunt", "sac_bunt_double_play",
+        "other_out",
+    )},
+}
 
-FEATURES = ("batter", "pitcher", "balls", "strikes")
 
 
-class PitchOutcomeModel(nn.Module):
-    """Two player lookups + 12-count one-hot -> 64 -> 32 -> outcome logits.
+ID_FEATURES = ("batter", "pitcher", "balls", "strikes")
+HAND_FEATURES = ("stand", "p_throws")
+# Rows missing any of these are dropped.
+REQUIRED_PITCH_FEATURES = (
+    "release_speed", "release_pos_x", "release_pos_z",
+    "pfx_x", "pfx_z", "plate_x", "plate_z", "sz_top", "sz_bot",
+)
+OPTIONAL_PITCH_FEATURES = ("release_spin_rate", "spin_axis", "release_extension")
 
-    ID zero is a fixed zero vector for players absent from the training set.
-    CrossEntropyLoss consumes logits; apply softmax only for probabilities.
-    """
+FASTBALL_TYPES = ("FF", "SI")
+MIN_FASTBALLS = 20
 
-    def __init__(self, num_batters, num_pitchers, embedding_dim=16, dropout=0.1):
-        super().__init__()
-        self.batter_embedding = nn.Embedding(
-            num_batters + 1, embedding_dim, padding_idx=0
-        )
-        self.pitcher_embedding = nn.Embedding(
-            num_pitchers + 1, embedding_dim, padding_idx=0
-        )
-        self.network = nn.Sequential(
-            nn.Linear(2 * embedding_dim + 12, 64),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, len(OUTCOMES)),
-        )
-
-    def forward(self, batter, pitcher, count):
-        count_one_hot = F.one_hot(count, num_classes=12).to(
-            dtype=self.batter_embedding.weight.dtype
-        )
-        inputs = torch.cat(
-            [self.batter_embedding(batter), self.pitcher_embedding(pitcher),
-             count_one_hot], dim=-1
-        )
-        return self.network(inputs)
+CONTINUOUS_FEATURES = (
+    "release_speed", "release_pos_x", "release_pos_z", "release_extension",
+    "release_spin_rate", "spin_axis_sin", "spin_axis_cos",
+    "pfx_x", "pfx_z",
+    "plate_x", "plate_z", "plate_z_in_zone",
+    "speed_minus_fastball", "pfx_x_minus_fastball", "pfx_z_minus_fastball",
+)
+BINARY_FEATURES = (
+    "batter_bats_right", "pitcher_throws_right", "same_handed",
+    "release_spin_rate_missing", "spin_axis_missing", "release_extension_missing",
+)
+PITCH_INPUTS = CONTINUOUS_FEATURES + BINARY_FEATURES
 
 
 def numeric_features(frame):
-    """Coerce features and identify valid integer IDs and pre-pitch counts."""
-    missing = set(FEATURES) - set(frame.columns)
+    """Coerce ID/count columns and identify valid integer IDs and pre-pitch counts."""
+    missing = set(ID_FEATURES) - set(frame.columns)
     if missing:
         raise ValueError(f"Missing columns: {sorted(missing)}")
-    numeric = frame.loc[:, list(FEATURES)].apply(pd.to_numeric, errors="coerce")
+    numeric = frame.loc[:, list(ID_FEATURES)].apply(pd.to_numeric, errors="coerce")
     valid = (numeric.notna() & np.isfinite(numeric) & numeric.mod(1).eq(0)).all(axis=1)
     valid &= numeric.batter.gt(0) & numeric.pitcher.gt(0)
     valid &= numeric.balls.between(0, 3) & numeric.strikes.between(0, 2)
     return numeric, valid
 
 
-def prepare_pitches(raw):
-    """Use descriptions for pitch results and events for hit_into_play rows.
+def pitch_features_valid(frame):
+    """Rows with usable handedness, required pitch measurements and strike zone."""
+    missing = set(HAND_FEATURES + REQUIRED_PITCH_FEATURES + OPTIONAL_PITCH_FEATURES) - set(frame.columns)
+    if missing:
+        raise ValueError(f"Missing columns: {sorted(missing)}")
+    required = frame.loc[:, list(REQUIRED_PITCH_FEATURES)].apply(pd.to_numeric, errors="coerce")
+    valid = (required.notna() & np.isfinite(required)).all(axis=1)
+    valid &= required.sz_top.gt(required.sz_bot)
+    for column in HAND_FEATURES:
+        valid &= frame[column].isin(("L", "R"))
+    return valid
 
-    Bunt descriptions, pitchouts, automatic calls, and unknown descriptions
-    are excluded. Foul tips share the coarse foul class; this model does not
-    attempt to simulate count transitions. Missing events are allowed for
-    non-contact pitches. In-play rows need a supported event; otherwise they
-    are excluded and reported separately from unsupported descriptions.
+
+def prepare_pitches(raw):
+    """Clean raw Statcast rows into model-ready pitches with a ``target`` column.
+
+    Pitch results come from ``description``; hit_into_play rows use ``events``.
+    Bunt descriptions, pitchouts, automatic calls, interference and unknown
+    descriptions are excluded, as are rows missing required pitch measurements
+    and (when game_type is present) non-regular-season games. Foul tips share
+    the foul class. Returns (frame sorted by date, report of what was dropped).
     """
     missing = {"game_date", "description", "events"} - set(raw.columns)
     if missing:
         raise ValueError(f"Missing columns: {sorted(missing)}")
     frame = raw.copy()
-    numeric, valid_features = numeric_features(frame)
+    numeric, valid_ids = numeric_features(frame)
+    valid_pitch = pitch_features_valid(frame)
+    regular = frame.game_type.eq("R") if "game_type" in frame else pd.Series(True, index=frame.index)
     dates = pd.to_datetime(frame.game_date, errors="coerce").dt.normalize()
     outcomes = frame.description.map(DESCRIPTION_TO_OUTCOME)
     in_play = frame.description.eq("hit_into_play").fillna(False)
-    outcomes.loc[in_play] = frame.loc[in_play, "events"].where(
-        frame.loc[in_play, "events"].isin(IN_PLAY_OUTCOMES)
-    )
-    valid = valid_features & dates.notna() & outcomes.notna()
+    outcomes.loc[in_play] = frame.loc[in_play, "events"].map(IN_PLAY_EVENT_TO_OUTCOME)
+    valid = valid_ids & valid_pitch & regular & dates.notna() & outcomes.notna()
     report = {
         "input_rows": len(frame),
         "retained_rows": int(valid.sum()),
         "excluded_rows": int((~valid).sum()),
+        "not_regular_season": int((~regular).sum()),
         "unsupported_descriptions": {
             str(key): int(value)
             for key, value in frame.loc[outcomes.isna() & ~in_play, "description"]
@@ -117,14 +133,16 @@ def prepare_pitches(raw):
             for key, value in frame.loc[in_play & outcomes.isna(), "events"]
             .fillna("<missing>").value_counts().items()
         },
-        "invalid_features_or_dates": int((~valid_features | dates.isna()).sum()),
+        "invalid_ids_counts_or_dates": int((~valid_ids | dates.isna()).sum()),
+        "missing_pitch_measurements": int((~valid_pitch).sum()),
     }
     frame = frame.loc[valid].copy()
-    frame[list(FEATURES)] = numeric.loc[valid].astype("int64")
+    frame[list(ID_FEATURES)] = numeric.loc[valid].astype("int64")
+    for column in REQUIRED_PITCH_FEATURES + OPTIONAL_PITCH_FEATURES:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").astype("float64")
     frame["game_date"] = dates.loc[valid]
-    frame["target"] = outcomes.loc[valid].map(
-        {name: index for index, name in enumerate(OUTCOMES)}
-    ).astype("int64")
+    frame["outcome"] = outcomes.loc[valid]
+    frame["target"] = frame.outcome.map(OUTCOME_INDEX).astype("int64")
     return frame.sort_values("game_date", kind="stable"), report
 
 
@@ -147,36 +165,161 @@ def chronological_split(frame, validation_start, test_start):
     return splits
 
 
-def fit_player_maps(train):
-    """Fit encoders on training players only, reserving zero for unknown IDs."""
+def fastball_reference(train):
+    """Average fastball speed and movement per pitcher, with per-hand fallbacks."""
+    fastballs = train.loc[train.pitch_type.isin(FASTBALL_TYPES)]
+    columns = ["release_speed", "pfx_x", "pfx_z"]
+    by_hand = fastballs.groupby("p_throws")[columns].mean()
+    grouped = fastballs.groupby("pitcher")[columns]
+    per_pitcher = grouped.mean().loc[grouped.size() >= MIN_FASTBALLS]
     return {
-        role: {int(player): index for index, player in
-               enumerate(sorted(train[role].unique()), start=1)}
-        for role in ("batter", "pitcher")
+        "pitcher": {int(p): [float(v) for v in row] for p, row in zip(per_pitcher.index, per_pitcher.to_numpy())},
+        "hand": {str(h): [float(v) for v in row] for h, row in zip(by_hand.index, by_hand.to_numpy())},
     }
 
 
-def encode_features(frame, player_maps):
-    numeric, valid = numeric_features(frame)
-    if not valid.all():
-        raise ValueError("Features require positive player IDs and integer counts (0-3, 0-2)")
-    numeric = numeric.astype("int64")
-    players = [
-        torch.from_numpy(
-            numeric[role].map(player_maps[role]).fillna(0).to_numpy(dtype=np.int64, copy=True)
-        ) for role in ("batter", "pitcher")
-    ]
-    count = torch.from_numpy(
-        (numeric.balls * 3 + numeric.strikes).to_numpy(dtype=np.int64, copy=True)
-    )
-    return (*players, count)
+def derive_pitch_features(frame, fastball_ref):
+    """Model-input columns before imputation and scaling (NaN where missing)."""
+    out = pd.DataFrame(index=frame.index)
+    for column in ("release_speed", "release_pos_x", "release_pos_z", "release_extension",
+                   "release_spin_rate", "pfx_x", "pfx_z", "plate_x", "plate_z"):
+        out[column] = frame[column].astype("float64")
+    radians = np.deg2rad(frame.spin_axis.astype("float64"))
+    out["spin_axis_sin"] = np.sin(radians)
+    out["spin_axis_cos"] = np.cos(radians)
+    # 0 = bottom of this batter's zone, 1 = top.
+    out["plate_z_in_zone"] = (frame.plate_z - frame.sz_bot) / (frame.sz_top - frame.sz_bot)
+
+    hand_ref = frame.p_throws.map(fastball_ref["hand"])
+    pitcher_ref = frame.pitcher.map(fastball_ref["pitcher"])
+    reference = pitcher_ref.where(pitcher_ref.notna(), hand_ref)
+    reference = np.array([r if isinstance(r, list) else [np.nan] * 3 for r in reference], dtype="float64").reshape(-1, 3)
+    out["speed_minus_fastball"] = out.release_speed.to_numpy() - reference[:, 0]
+    out["pfx_x_minus_fastball"] = out.pfx_x.to_numpy() - reference[:, 1]
+    out["pfx_z_minus_fastball"] = out.pfx_z.to_numpy() - reference[:, 2]
+
+    out["batter_bats_right"] = frame.stand.eq("R").astype("float64")
+    out["pitcher_throws_right"] = frame.p_throws.eq("R").astype("float64")
+    out["same_handed"] = frame.stand.eq(frame.p_throws).astype("float64")
+    for column in OPTIONAL_PITCH_FEATURES:
+        out[f"{column}_missing"] = frame[column].isna().astype("float64")
+    return out.loc[:, list(PITCH_INPUTS)]
 
 
-def make_dataset(frame, player_maps):
+class PitchPreprocessor:
+    """Everything learned from the training split: player IDs and feature scaling.
+
+    Players with fewer than ``min_pitches`` training pitches share ID zero with
+    players never seen in training.
+    """
+
+    def __init__(self, player_maps, fastball_ref, medians, means, stds, min_pitches):
+        self.player_maps = player_maps
+        self.fastball_ref = fastball_ref
+        self.medians = medians
+        self.means = means
+        self.stds = stds
+        self.min_pitches = min_pitches
+
+    @classmethod
+    def fit(cls, train, min_pitches=100):
+        player_maps = {}
+        for role in ("batter", "pitcher"):
+            counts = train[role].value_counts()
+            kept = sorted(int(player) for player in counts.index[counts >= min_pitches])
+            player_maps[role] = {player: index for index, player in enumerate(kept, start=1)}
+        fastball_ref = fastball_reference(train)
+        raw = derive_pitch_features(train, fastball_ref)
+        medians = raw.loc[:, list(CONTINUOUS_FEATURES)].median()
+        filled = raw.loc[:, list(CONTINUOUS_FEATURES)].fillna(medians)
+        stds = filled.std().replace(0, 1.0)
+        return cls(
+            player_maps, fastball_ref,
+            {k: float(v) for k, v in medians.items()},
+            {k: float(v) for k, v in filled.mean().items()},
+            {k: float(v) for k, v in stds.items()},
+            min_pitches,
+        )
+
+    def pitch_matrix(self, frame):
+        """Imputed, standardized pitch inputs as a float32 array (rows x PITCH_INPUTS)."""
+        raw = derive_pitch_features(frame, self.fastball_ref)
+        continuous = raw.loc[:, list(CONTINUOUS_FEATURES)].fillna(pd.Series(self.medians))
+        continuous = (continuous - pd.Series(self.means)) / pd.Series(self.stds)
+        return np.concatenate(
+            [continuous.to_numpy(dtype=np.float32), raw.loc[:, list(BINARY_FEATURES)].to_numpy(dtype=np.float32)],
+            axis=1,
+        )
+
+    def encode(self, frame):
+        """Return (batter_ids, pitcher_ids, count_index, pitch_matrix) tensors."""
+        numeric, valid = numeric_features(frame)
+        if not valid.all():
+            raise ValueError("Features require positive player IDs and integer counts (0-3, 0-2)")
+        if not pitch_features_valid(frame).all():
+            raise ValueError("Rows are missing required pitch measurements; run prepare_pitches first")
+        numeric = numeric.astype("int64")
+        players = [
+            torch.from_numpy(
+                numeric[role].map(self.player_maps[role]).fillna(0).to_numpy(dtype=np.int64, copy=True)
+            ) for role in ("batter", "pitcher")
+        ]
+        count = torch.from_numpy((numeric.balls * 3 + numeric.strikes).to_numpy(dtype=np.int64, copy=True))
+        frame = frame.assign(pitcher=numeric.pitcher)
+        pitch = torch.from_numpy(self.pitch_matrix(frame))
+        return (*players, count, pitch)
+
+    def state_dict(self):
+        return {
+            "player_maps": self.player_maps, "fastball_ref": self.fastball_ref,
+            "medians": self.medians, "means": self.means, "stds": self.stds,
+            "min_pitches": self.min_pitches,
+        }
+
+    @classmethod
+    def from_state_dict(cls, state):
+        return cls(**state)
+
+
+def make_dataset(frame, preprocessor):
     return TensorDataset(
-        *encode_features(frame, player_maps),
+        *preprocessor.encode(frame),
         torch.from_numpy(frame.target.to_numpy(dtype=np.int64, copy=True)),
     )
+
+
+# --------------------------------------------------------------------------
+# Model
+# --------------------------------------------------------------------------
+
+class PitchOutcomeModel(nn.Module):
+    """Batter and pitcher vectors + count one-hot + pitch inputs -> MLP -> outcome logits.
+
+    ID zero is a fixed zero vector for unknown or rare players. With
+    use_players=False the player vectors are left out entirely (pitch-only
+    baseline). CrossEntropyLoss consumes logits; apply softmax for probabilities.
+    """
+
+    def __init__(self, num_batters, num_pitchers, num_pitch_features=len(PITCH_INPUTS),
+                 embedding_dim=16, hidden_sizes=(128, 64), dropout=0.1, use_players=True):
+        super().__init__()
+        self.use_players = use_players
+        if use_players:
+            self.batter_embedding = nn.Embedding(num_batters + 1, embedding_dim, padding_idx=0)
+            self.pitcher_embedding = nn.Embedding(num_pitchers + 1, embedding_dim, padding_idx=0)
+        width = (2 * embedding_dim if use_players else 0) + 12 + num_pitch_features
+        layers = []
+        for size in hidden_sizes:
+            layers += [nn.Linear(width, size), nn.ReLU(), nn.Dropout(dropout)]
+            width = size
+        layers.append(nn.Linear(width, len(OUTCOMES)))
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, batter, pitcher, count, pitch):
+        parts = [F.one_hot(count, num_classes=12).to(pitch.dtype), pitch]
+        if self.use_players:
+            parts = [self.batter_embedding(batter), self.pitcher_embedding(pitcher)] + parts
+        return self.network(torch.cat(parts, dim=-1))
 
 
 def load_checkpoint(path):
@@ -184,13 +327,15 @@ def load_checkpoint(path):
     model = PitchOutcomeModel(**checkpoint["model_config"])
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
-    return model, checkpoint["player_maps"]
+    return model, PitchPreprocessor.from_state_dict(checkpoint["preprocessor"])
 
 
 @torch.inference_mode()
-def predict_pitches(model, frame, player_maps, batch_size=4096):
-    """Return probabilities in input row order; no outcome columns are needed."""
-    features = encode_features(frame, player_maps)
+def predict_pitches(model, frame, preprocessor, batch_size=8192):
+    """Return outcome probabilities in input row order."""
+    if len(frame) == 0:
+        return pd.DataFrame(columns=OUTCOMES, dtype="float32")
+    features = preprocessor.encode(frame)
     device = next(model.parameters()).device
     was_training = model.training
     model.eval()
