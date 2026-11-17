@@ -222,3 +222,6 @@ __marimo__/
 # Downloaded pitch data and trained checkpoints
 data/
 artifacts/
+pitcher2vec2010seve.zip
+pitcher2vec2010seve/
+weights.weights.h5
