@@ -1,0 +1,43 @@
+{
+  "seasons": [
+    2023
+  ],
+  "valid_fraction": 0.05,
+  "test_fraction": 0.05,
+  "min_pitches": 100,
+  "embedding_dim": 32,
+  "hidden": [
+    64,
+    32
+  ],
+  "contact_hidden": [
+    64,
+    32
+  ],
+  "contact_inputs": "all",
+  "contact_weight": 0.620287,
+  "value_hidden": [],
+  "value_target": "woba",
+  "value_weight": 1.47247,
+  "dropout": 0.269001,
+  "epochs": 30,
+  "patience": 3,
+  "batch_size": 4096,
+  "lr": 0.00489,
+  "weight_decay": 4.47395e-06,
+  "embedding_weight_decay": 0.000975516,
+  "device": "cuda",
+  "seed": 8,
+  "frozen_epochs": 10,
+  "finetune_epochs": 10,
+  "head_lr_scale": 0.1,
+  "init_std": 0.01,
+  "min_pa": 300,
+  "folds": 5,
+  "pair_min_pitches": 1000,
+  "data": [
+    "data/pitches_2023.parquet"
+  ],
+  "output_dir": "runs/sequential/2023",
+  "sequential_base_season": 2022
+}

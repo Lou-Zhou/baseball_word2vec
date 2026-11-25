@@ -32,6 +32,11 @@ One network, three heads, all sharing the same batter and pitcher embeddings:
 - **Every season is self-contained**: one model per season, trained only on that season's
   pitches.
 
+**Pretrained models and embeddings for 2022–2026** are in [`models/`](models/README.md). They
+share one embedding space, and you can use them without downloading data or training, for
+example `python src/embeddings_to_woba.py --run models/sequential/2026 --embeddings
+models/sequential/batter_embeddings_by_season.csv --season 2026`.
+
 ## Setup
 
 ```bash
