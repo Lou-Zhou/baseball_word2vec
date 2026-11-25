@@ -1,0 +1,8 @@
+numpy>=2.0
+pandas>=2.2
+pyarrow>=15
+torch>=2.3
+pybaseball>=2.2.7
+matplotlib>=3.8
+optuna>=4.0
+plotly>=5.0  # optional: Optuna history / importance plots in tune.py

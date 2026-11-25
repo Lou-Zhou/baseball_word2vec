@@ -1,0 +1,10 @@
+# Downloaded Statcast data, Savant leaderboards and trained runs (regenerate with src/run_pipeline.py)
+data/
+runs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
